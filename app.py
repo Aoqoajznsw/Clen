@@ -1,6 +1,6 @@
 from flask import Flask, request, send_from_directory, jsonify, render_template_string, redirect
 import sqlite3, uuid, os, time, requests, json, mimetypes, re
-from device_detector import DeviceDetector  # <-- НОВАЯ БИБЛИОТЕКА
+from device_detector import DeviceDetector
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'static/uploads'
@@ -12,16 +12,25 @@ ADMIN_SECRET = "18iwixjwi199woxk"
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
+    # Создаём таблицу links, если её нет
     c.execute('''CREATE TABLE IF NOT EXISTS links
                  (uid TEXT PRIMARY KEY, filename TEXT, original_name TEXT, mime_type TEXT,
                   custom_title TEXT, custom_text TEXT, bg_color TEXT, language TEXT,
                   slug TEXT UNIQUE, created INTEGER)''')
+    # Добавляем столбцы, если они отсутствуют (миграция)
+    for col in ['bg_color', 'slug']:
+        try:
+            c.execute(f"ALTER TABLE links ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass  # столбец уже существует
+    # Таблица логов
     c.execute('''CREATE TABLE IF NOT EXISTS logs
                  (uid TEXT, ip TEXT, ua TEXT, city TEXT, fingerprint TEXT, time INTEGER)''')
     conn.commit()
     conn.close()
 init_db()
 
+# ========== СТИЛИ (без изменений) ==========
 STYLES = """
 <style>
     body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f7fa; }
@@ -68,7 +77,7 @@ STYLES = """
 </style>
 """
 
-# ========== ГЕОЛОКАЦИЯ (3 источника) ==========
+# ========== ГЕОЛОКАЦИЯ (три источника) ==========
 def get_geo_info(ip):
     result = {
         'city_ipapi': '',
@@ -236,17 +245,21 @@ def upload(secret):
     if not slug:
         slug = uid
 
-    conn = sqlite3.connect(DB)
-    existing = conn.execute("SELECT uid FROM links WHERE slug=?", (slug,)).fetchone()
-    if existing and existing[0] != uid:
-        conn.close()
-        return "Этот алиас уже используется, выберите другой", 400
+    try:
+        conn = sqlite3.connect(DB)
+        # Проверяем, что slug уникален
+        existing = conn.execute("SELECT uid FROM links WHERE slug=?", (slug,)).fetchone()
+        if existing and existing[0] != uid:
+            conn.close()
+            return "Этот алиас уже используется, выберите другой", 400
 
-    conn.execute("INSERT INTO links (uid, filename, original_name, mime_type, custom_title, custom_text, bg_color, language, slug, created) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                 (uid, filename, original_name, mime_type, custom_title, custom_text, bg_color, language, slug, int(time.time())))
-    conn.commit()
-    conn.close()
-    
+        conn.execute("INSERT INTO links (uid, filename, original_name, mime_type, custom_title, custom_text, bg_color, language, slug, created) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (uid, filename, original_name, mime_type, custom_title, custom_text, bg_color, language, slug, int(time.time())))
+        conn.commit()
+        conn.close()
+    except sqlite3.OperationalError as e:
+        return f"Ошибка базы данных: {e}. Возможно, таблица не обновлена. Попробуйте удалить db.sqlite и перезапустить.", 500
+
     base_url = request.host_url.rstrip('/')
     link = f"{base_url}/{slug}"
     return render_template_string('''
@@ -433,10 +446,10 @@ TRACK_PAGE_TEMPLATE = """
 def track(uid):
     conn = sqlite3.connect(DB)
     row = conn.execute("SELECT filename, original_name, mime_type, custom_title, custom_text, bg_color, language FROM links WHERE uid=?", (uid,)).fetchone()
-    if not row:
-        return "Not found", 404
-    filename, original_name, mime_type, custom_title, custom_text, bg_color, language = row
     conn.close()
+    if not row:
+        return "Файл не найден", 404
+    filename, original_name, mime_type, custom_title, custom_text, bg_color, language = row
     title = custom_title if custom_title else 'Просмотр'
     text = custom_text if custom_text else 'Данный файл открыт для просмотра.'
     bg = bg_color if bg_color else '#ffffff'
@@ -444,7 +457,7 @@ def track(uid):
                                   uid=uid, filename=filename, original_name=original_name, mime_type=mime_type,
                                   title=title, custom_text=text, bg_color=bg)
 
-# ========== СБОР ДАННЫХ (с DeviceDetector) ==========
+# ========== СБОР ДАННЫХ ==========
 @app.route('/collect', methods=['POST'])
 def collect():
     data = request.get_json()
@@ -454,43 +467,19 @@ def collect():
     ip = get_real_ip()
     ua = request.headers.get('User-Agent', '')
     
-    # Геолокация
     geo = get_geo_info(ip)
     
-    # Определение устройства через DeviceDetector
-    dd = DeviceDetector(ua).parse()
-    device_brand = dd.brand() or 'Неизвестно'
-    device_model = dd.model() or 'Неизвестно'
-    os_name = dd.os_name() or 'Неизвестно'
-    os_version = dd.os_version() or 'Неизвестно'
+    # Определение модели через DeviceDetector
+    try:
+        dd = DeviceDetector(ua).parse()
+        device_brand = dd.brand() or 'Неизвестно'
+        device_model = dd.model() or 'Неизвестно'
+        os_version = dd.os_version() or 'Неизвестно'
+    except Exception as e:
+        device_brand = device_model = os_version = 'Ошибка парсинга'
     
-    # Если модель не определена, пробуем извлечь вручную (запасной вариант)
-    if device_model == 'Неизвестно' or 'Other' in device_model:
-        if 'iPhone' in ua:
-            match = re.search(r'iPhone(\d+,\d+)', ua)
-            if match:
-                device_model = 'iPhone ' + match.group(1)
-            else:
-                device_model = 'iPhone'
-        elif 'Android' in ua:
-            match = re.search(r'; (SM-[A-Za-z0-9]+)', ua)
-            if match:
-                device_model = match.group(1)
-    
-    # Если бренд не определён, но модель есть, пытаемся угадать из модели
-    if device_brand == 'Неизвестно' and device_model != 'Неизвестно':
-        # Простая эвристика по первым буквам
-        if device_model.startswith('SM-'):
-            device_brand = 'Samsung'
-        elif device_model.startswith('iPhone'):
-            device_brand = 'Apple'
-        elif device_model.startswith('Pixel'):
-            device_brand = 'Google'
-        # и т.д. — можно расширить
-
     operator = geo.get('org', '')
     
-    # Добавляем данные в fingerprint
     data['os_version'] = os_version
     data['device_model'] = device_model
     data['device_brand'] = device_brand
@@ -506,7 +495,7 @@ def collect():
     conn.close()
     return jsonify({"status": "ok"})
 
-# ========== СТРАНИЦА ЛОГОВ (админка) ==========
+# ========== СТРАНИЦА ЛОГОВ ==========
 @app.route('/admin/<secret>/logs')
 @require_secret
 def admin_logs(secret):
