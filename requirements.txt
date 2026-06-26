@@ -1,5 +1,4 @@
 Flask
 requests
 gunicorn
-user-agents
 device-detector
